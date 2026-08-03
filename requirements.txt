@@ -1,0 +1,7 @@
+streamlit>=1.28.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+ezdxf>=1.0.0
+shapely>=2.0.0
+flask>=2.3.0
+werkzeug>=2.3.0
