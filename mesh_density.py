@@ -10,6 +10,7 @@ COLOR_MAP = {
     1: '#ff0000', 2: '#ffff00', 3: '#00ff00', 4: '#00ffff',
     5: '#0000ff', 6: '#ff00ff', 7: '#ffffff'
 }
+CORNER_TURN_THRESHOLD_DEGREES = 60.0
 
 def dxf_color_to_hex(color_idx, fallback='#888888'):
     if color_idx is None or color_idx == 256:
@@ -264,7 +265,7 @@ def spacing_field(params, x, y):
     t_smooth = t * t * (3 - 2 * t)
     return s_min + (s_max - s_min) * t_smooth
 
-def redistribute_polyline(coords, params):
+def _redistribute_segment(coords, params):
     if len(coords) < 2:
         return coords
     diffs = np.diff(coords, axis=0)
@@ -327,6 +328,33 @@ def redistribute_polyline(coords, params):
             new_pts.append(np.array([nx, ny]))
     new_pts.append(coords[-1].copy())
     return np.array(new_pts)
+
+def redistribute_polyline(coords, params):
+    if len(coords) < 3:
+        return _redistribute_segment(coords, params)
+
+    incoming = coords[1:-1] - coords[:-2]
+    outgoing = coords[2:] - coords[1:-1]
+    lengths = np.linalg.norm(incoming, axis=1) * np.linalg.norm(outgoing, axis=1)
+    valid = lengths > 1e-12
+    if not np.any(valid):
+        return _redistribute_segment(coords, params)
+
+    cos_angles = np.ones(len(lengths))
+    cos_angles[valid] = np.sum(incoming[valid] * outgoing[valid], axis=1) / lengths[valid]
+    turn_angles = np.degrees(np.arccos(np.clip(cos_angles, -1.0, 1.0)))
+    corner_indices = np.flatnonzero(turn_angles >= CORNER_TURN_THRESHOLD_DEGREES) + 1
+    if len(corner_indices) == 0:
+        return _redistribute_segment(coords, params)
+
+    split_indices = np.concatenate(([0], corner_indices, [len(coords) - 1]))
+    redistributed_segments = []
+    for start, end in zip(split_indices[:-1], split_indices[1:]):
+        segment = _redistribute_segment(coords[start:end + 1], params)
+        if redistributed_segments:
+            segment = segment[1:]
+        redistributed_segments.append(segment)
+    return np.concatenate(redistributed_segments, axis=0)
 
 def find_connection_points(polylines, tol=1e-3):
     endpoints = []

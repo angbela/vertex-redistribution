@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import hashlib
 import uuid
 import tempfile
 import numpy as np
@@ -73,8 +74,8 @@ def job_dir(job_id):
     return d
 
 
-def load_and_process_dxf(filepath):
-    polylines = extract_polylines(filepath, target_layers=TARGET_LAYERS)
+def load_and_process_dxf(filepath, target_layers=None):
+    polylines = extract_polylines(filepath, target_layers=target_layers)
     all_polys = []
     for p in polylines:
         if p['layer'].lower() == 'domain':
@@ -251,67 +252,87 @@ def legend_markdown():
 
 def step1_upload():
     st.subheader('📐 Step 1 — Upload DXF File')
-    st.markdown('_Coastline + boundary layers (Batas Pantai, domain, Kontur, Daratan)_')
+    st.markdown('_Choose which DXF layers to include in the analysis._')
     uploaded = st.file_uploader('Choose a .dxf file', type=['dxf'], accept_multiple_files=False,
                                 help='DXF file containing coastline and boundary polylines.')
     if uploaded is not None:
-        with st.spinner('Parsing DXF file...'):
-            suffix = os.path.splitext(uploaded.name)[1]
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-                tmp.write(uploaded.read())
-                tmp_path = tmp.name
+        uploaded_bytes = uploaded.getvalue()
+        upload_hash = hashlib.sha256(uploaded_bytes).hexdigest()
+        if st.session_state.get('parsed_upload_hash') != upload_hash:
+            tmp_path = None
             try:
-                polylines = load_and_process_dxf(tmp_path)
+                with st.spinner('Reading DXF layers...'):
+                    suffix = os.path.splitext(uploaded.name)[1]
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                        tmp.write(uploaded_bytes)
+                        tmp_path = tmp.name
+                    polylines = load_and_process_dxf(tmp_path)
+                st.session_state.parsed_upload_hash = upload_hash
+                st.session_state.available_polylines = polylines
             except Exception as e:
                 st.error(f'❌ Failed to read DXF: {e}')
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
                 return
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError as e:
+                        st.error(f'❌ Failed to remove temporary DXF file: {e}')
 
-        if len(polylines) == 0:
-            st.warning('⚠️ No polylines found in target layers. Expected layers: ' +
-                       ', '.join(TARGET_LAYERS))
+        available_polylines = st.session_state.available_polylines
+        if len(available_polylines) == 0:
+            st.warning('⚠️ No supported line or polyline entities were found in this DXF.')
             return
 
-        job_id = uuid.uuid4().hex[:10]
-        st.session_state.job_id = job_id
-        st.session_state.original_filename = uploaded.name
-        st.session_state.polylines = polylines
+        layers = sorted({p['layer'] for p in available_polylines}, key=str.casefold)
+        st.markdown('#### Select layers for analysis')
+        st.caption('Layers shown here contain supported line or polyline entities.')
+        layer_columns = st.columns(3)
+        selected_layers = []
+        for i, layer in enumerate(layers):
+            default_selected = layer.casefold() in {name.casefold() for name in TARGET_LAYERS}
+            if layer_columns[i % len(layer_columns)].checkbox(
+                layer,
+                value=default_selected,
+                key=f'layer-{upload_hash}-{layer}',
+            ):
+                selected_layers.append(layer)
+
+        polylines = [p for p in available_polylines if p['layer'] in selected_layers]
+        if len(polylines) == 0:
+            st.warning('⚠️ Select at least one layer containing linework to continue.')
+            return
+
         geojson = polylines_to_geojson(polylines)
-        st.session_state.geojson_before = geojson
         bbox = geojson['bbox']
-        st.session_state.bbox = bbox
         span_x = bbox[2] - bbox[0]
         span_y = bbox[3] - bbox[1]
-        st.session_state.span_x = span_x
-        st.session_state.span_y = span_y
-        save_dir = job_dir(job_id)
-        with open(os.path.join(save_dir, 'polylines_before.geojson'), 'w') as fh:
-            json.dump(geojson, fh)
 
-        total_segments = len(geojson['features'])
-        total_pts = sum(f['properties']['n_pts'] for f in geojson['features'])
-
-        st.success(f'✅ Successfully loaded **{uploaded.name}**')
+        st.success(f'✅ **{uploaded.name}** — {len(selected_layers)} layer(s) selected')
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric('Segments', f'{total_segments}')
-        c2.metric('Total Points', f'{total_pts:,}')
+        c1.metric('Segments', f'{len(geojson["features"])}')
+        c2.metric('Total Points', f'{sum(f["properties"]["n_pts"] for f in geojson["features"]):,}')
         c3.metric('X Span', f'{span_x:.2f}')
         c4.metric('Y Span', f'{span_y:.2f}')
 
         with st.expander('🗺️ Geometry Preview', expanded=True):
-            fig = plot_geometry(polylines, bbox=bbox, title='Uploaded Geometry (before redistribution)')
+            fig = plot_geometry(polylines, bbox=bbox, title='Selected Layers (before redistribution)')
             st.pyplot(fig, clear_figure=True)
             legend_markdown()
 
         st.markdown('---')
         if st.button('➡️ Proceed to Step 2 — Define Focus Area', use_container_width=True, type='primary'):
+            job_id = uuid.uuid4().hex[:10]
+            st.session_state.job_id = job_id
+            st.session_state.original_filename = uploaded.name
+            st.session_state.polylines = polylines
+            st.session_state.geojson_before = geojson
+            st.session_state.bbox = bbox
+            st.session_state.span_x = span_x
+            st.session_state.span_y = span_y
+            save_dir = job_dir(job_id)
+            with open(os.path.join(save_dir, 'polylines_before.geojson'), 'w') as fh:
+                json.dump(geojson, fh)
             st.session_state.step = 2
             st.rerun()
 
